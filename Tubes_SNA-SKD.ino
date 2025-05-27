@@ -68,6 +68,58 @@ WebServer server(80);
 String logBuffer = "";
 
 // ============================
+// FUNGSI WEB HANDLING
+// ============================
+
+// Fungsi untuk menghasilkan halaman web (form PID + log)
+// Bagian PID form ditampilkan dengan CSS fixed agar tetap di tempat saat scroll.
+String pageTemplate() {
+  String page = "<html><head><title>Solar Tracker Log & PID Tuning</title>";
+  page += "<style>";
+  page += "body { font-family: Arial, sans-serif; margin: 0; padding: 0; }";
+  page += "#pid-form { position: fixed; top: 0; left: 0; width: 100%; background-color: #f2f2f2; padding: 10px; border-bottom: 2px solid #333; z-index: 1000; }";
+  page += "#log-container { margin-top: 120px; padding: 10px; }";
+  page += "</style></head><body>";
+  
+  // Fixed PID tuning form
+  page += "<div id='pid-form'>";
+  page += "<h2>PID Tuning</h2>";
+  page += "<form action='/updatePID' method='POST'>";
+  page += "Kp: <input type='text' name='Kp' value='" + String(Kp) + "'> &nbsp; ";
+  page += "Ki: <input type='text' name='Ki' value='" + String(Ki) + "'> &nbsp; ";
+  page += "Kd: <input type='text' name='Kd' value='" + String(Kd) + "'> &nbsp; ";
+  page += "<input type='submit' value='Update'>";
+  page += "</form>";
+  page += "</div>";
+  
+  // Log container
+  page += "<div id='log-container'>";
+  page += "<h2>Solar Tracker Log</h2>";
+  page += "<p><strong>Status Mode:</strong> " + String(isSleepMode ? "Sleep Mode (Panel Tertutup)" : "Active Mode (Tracking Matahari)") + "</p>";
+  page += logBuffer;
+  page += "</div>";
+  
+  page += "</body></html>";
+  return page;
+}
+
+void handleLog() {
+  server.send(200, "text/html", pageTemplate());
+}
+
+// Handler untuk memperbarui nilai PID dari form web (metode POST)
+void handlePIDUpdate() {
+  if (server.hasArg("Kp") && server.hasArg("Ki") && server.hasArg("Kd")) {
+    Kp = server.arg("Kp").toDouble();
+    Ki = server.arg("Ki").toDouble();
+    Kd = server.arg("Kd").toDouble();
+  }
+  // Redirect kembali ke halaman log
+  server.sendHeader("Location", "/log", true);
+  server.send(302, "text/plain", "");
+}
+
+// ============================
 // KONFIGURASI ACCESS POINT
 // ============================
 const char* ssid     = "SolarTracker_Hotspot";
@@ -84,6 +136,8 @@ void settoNorth() {
     Serial.print("Posisi sekarang: ");
     Serial.print(derajat);
     Serial.println();
+
+    //PUH PERGERAKAN MOTORNYA GW GA PAHAM
 
   }while( 0> derajat <3 );
 }
@@ -111,21 +165,22 @@ void resetPanelPosition() {
   Serial.println("Rotasi horizontal dikembalikan ke titik nol.");
 }
 
-  // ============================
-  // FUNGSI KALIBRASI OTOMATIS tiltScaleFactor
-  // ============================
-  void autoCalibrateTiltScaleFactor() {
-    double tiltChange = abs(tiltInput - lastTiltInput);
-    double ldrChange  = abs(ldrVerticalDiff - lastLDRDiff);
+// ============================
+// FUNGSI KALIBRASI OTOMATIS tiltScaleFactor
+// ============================
+void autoCalibrateTiltScaleFactor() {
+  double tiltChange = abs(tiltInput - lastTiltInput);
+  double ldrChange  = abs(ldrVerticalDiff - lastLDRDiff);
 
-    if (ldrChange > 0) {
-      tiltScaleFactor = tiltChange / ldrChange;
-      Serial.print("Kalibrasi otomatis! tiltScaleFactor baru: ");
-      Serial.println(tiltScaleFactor);
-    }
-    lastTiltInput = tiltInput;
-    lastLDRDiff   = ldrVerticalDiff;
+  if (ldrChange > 0) {
+    tiltScaleFactor = tiltChange / ldrChange;
+    Serial.print("Kalibrasi otomatis! tiltScaleFactor baru: ");
+    Serial.println(tiltScaleFactor);
   }
+
+  lastTiltInput = tiltInput;
+  lastLDRDiff   = ldrVerticalDiff;
+}
 
 // ============================
 // SETUP SISTEM
@@ -160,15 +215,9 @@ void setup() {
   Serial.println("Access Point aktif. Hubungkan ke SSID: " + String(ssid));
   Serial.println("IP Address: " + WiFi.softAPIP().toString());
 
-  // Setup route web server
-  server.on("/log", []() {
-    String page = "<html><head><title>Solar Tracker Log</title></head><body>";
-    page += "<h1>Solar Tracker Log</h1>";
-    page += logBuffer;
-    page += "</body></html>";
-    server.send(200, "text/html", page);
-  });
-
+  // Setup route untuk web server
+  server.on("/log", handleLog);
+  server.on("/updatePID", HTTP_POST, handlePIDUpdate);
   server.begin();
   Serial.println("Web server mulai.");
 
@@ -239,12 +288,14 @@ void loop() {
     
     double topAverage = (ldrTopLeft + ldrTopRight) / 2.0;
     double bottomAverage = (ldrBottomLeft + ldrBottomRight) / 2.0;
-    double tiltError = topAverage - bottomAverage;
+    double ldrVerticalDiff = topAverage - bottomAverage;
     
     // --- Kontrol Motor Horizontal ---
     // Perhitungan PWM menggunakan faktor proporsional (PID: secara default hanya Kp dipakai di sini;
     // Ki & Kd dapat diintegrasikan sesuai kompleksitas sistem)
-    int pwmHorizontal = constrain(int(abs(horizontalError * Kp)), 0, 255);
+    horizontalPID.Compute(); 
+
+    int pwmHorizontal = constrain(int(abs(horizontalOutput)), 0, 255);
     if (horizontalError >= 0) {
       digitalWrite(MOTOR_HORIZONTAL_IN1, HIGH);
       digitalWrite(MOTOR_HORIZONTAL_IN2, LOW);
@@ -254,9 +305,12 @@ void loop() {
     }
     analogWrite(MOTOR_HORIZONTAL_PWM, pwmHorizontal);
     
+    double desiredTilt = ldrVerticalDiff * tiltScaleFactor;
+    tiltSetpoint = desiredTilt;
+
     // --- Kontrol Motor Tilt ---
-    int pwmTilt = constrain(int(abs(tiltError * tiltScaleFactor * Kp)), 0, 255);
-    if (tiltError >= 0) {
+    int pwmTilt = constrain(int(abs(tiltOutput)), 0, 255);
+    if (ldrVerticalDiff >= 0) {
       digitalWrite(MOTOR_TILT_IN1, HIGH);
       digitalWrite(MOTOR_TILT_IN2, LOW);
     } else {
@@ -274,39 +328,6 @@ void loop() {
               ", Kd=" + String(Kd) + ")</p>" + logBuffer;
   
   // Batasi panjang logBuffer (opsional)
-  if (logBuffer.length() > 8000) {
-    logBuffer = logBuffer.substring(0, 8000);
-  }
-  
-  delay(500);
-
-
-
-
-  // Hitung error horizontal (selisih antara kiri dan kanan)
-  horizontalError = ((ldr_top_left + ldr_bottom_left) / 2.0) - ((ldr_top_right + ldr_bottom_right) / 2.0);
-  horizontalPID.Compute();
-  
-  int pwmMotor = constrain(abs(horizontalOutput), 0, 255);
-  if (horizontalOutput >= 0) {
-    digitalWrite(GEAR_MOTOR_IN1_PIN, HIGH);
-    digitalWrite(GEAR_MOTOR_IN2_PIN, LOW);
-  } else {
-    digitalWrite(GEAR_MOTOR_IN1_PIN, LOW);
-    digitalWrite(GEAR_MOTOR_IN2_PIN, HIGH);
-  }
-  analogWrite(GEAR_MOTOR_EN_PIN, pwmMotor);
-
-  // Auto Sleep Mode: jika intensitas cahaya sangat rendah
-  if (lightIntensity < 200) {
-    Serial.println("Masuk Sleep Mode.");
-    resetPanelPosition();
-  }
-
-  // Update log sistem yang bisa diakses dari halaman web
-  logBuffer = "<p>Light: " + String(lightIntensity) +
-              " | Horizontal PID Output: " + String(horizontalOutput) +
-              " | Status: " + (lightIntensity < 200 ? "Sleep Mode" : "Tracking Mode") + "</p>" + logBuffer;
   if (logBuffer.length() > 8000) {
     logBuffer = logBuffer.substring(0, 8000);
   }
