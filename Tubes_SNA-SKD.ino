@@ -38,6 +38,18 @@ const int ACTUATOR_EN_PIN  = 9;     // Pin PWM untuk kecepatan aktuator kemiring
 #define PI 3.14159265358979323846
 #endif
 
+// Batasan Rotasi Horizontal (Azimuth) untuk mencegah kabel terlilit
+// QMC5883LCompass.getAzimuth() mengembalikan nilai dari -180 hingga 180 derajat.
+// Batasan ini akan menjaga panel dalam rentang aman, misalnya +/- 170 derajat dari Utara.
+const int MIN_AZIMUTH_LIMIT = -170; // Batas minimum (misalnya, 170 derajat Barat)
+const int MAX_AZIMUTH_LIMIT = 170;  // Batas maksimum (misalnya, 170 derajat Timur)
+
+// Konstanta untuk Reset Posisi
+const double RESET_TILT_ANGLE = 0.0; // Sudut kemiringan target untuk reset (misalnya, 0.0 untuk datar)
+                                     // Sesuaikan nilai ini dengan posisi "nol" atau "tertutup" panel Anda.
+const int RESET_HORIZ_AZIMUTH = MIN_AZIMUTH_LIMIT; // Azimuth target untuk reset horizontal
+                                                  // Ini akan menggerakkan panel ke batas kiri (MIN_AZIMUTH_LIMIT) sebagai posisi "rumah"
+
 // ============================
 // VARIABEL PID DAN TILT
 // ============================
@@ -223,29 +235,53 @@ void settoNorth() {
 
     do {
         compass.read();
-        int derajat = compass.getAzimuth(); // Dapatkan azimuth dalam derajat
+        int derajat = compass.getAzimuth(); // Dapatkan azimuth dalam derajat (-180 hingga 180)
         Serial.print("Posisi sekarang: ");
         Serial.print(derajat);
         Serial.println(" derajat");
 
-        // Implementasi logika pergerakan motor horizontal
-        // Asumsi 0 derajat adalah Utara. Toleransi +/- 5 derajat dari Utara
-        if (derajat > 5 && derajat <= 180) { // Jika menghadap ke Timur (0-180), putar berlawanan arah jarum jam (kiri)
-            digitalWrite(GEAR_MOTOR_IN1_PIN, LOW);
-            digitalWrite(GEAR_MOTOR_IN2_PIN, HIGH);
-            analogWrite(GEAR_MOTOR_EN_PIN, SIMPLE_PWM_SPEED); // Menggunakan kecepatan sederhana
-            Serial.println("Memutar ke kiri...");
-        } else if (derajat < -5 || (derajat > 180 && derajat < 355)) { // Jika menghadap ke Barat (0 ke -180) atau >180 (dekat ke 0 lagi dari selatan), putar searah jarum jam (kanan)
-            digitalWrite(GEAR_MOTOR_IN1_PIN, HIGH);
-            digitalWrite(GEAR_MOTOR_IN2_PIN, LOW);
-            analogWrite(GEAR_MOTOR_EN_PIN, SIMPLE_PWM_SPEED); // Menggunakan kecepatan sederhana
-            Serial.println("Memutar ke kanan...");
+        bool moved = false; // Flag untuk memeriksa apakah motor bergerak
+
+        // Logika untuk bergerak menuju Utara (0 derajat) sambil menghormati batasan rotasi
+        if (derajat > 5) { // Jika menghadap ke Timur secara signifikan (> 5 derajat), putar berlawanan arah jarum jam (kiri)
+            // Pastikan tidak melewati batas bawah saat bergerak ke kiri
+            if (derajat > MIN_AZIMUTH_LIMIT) {
+                digitalWrite(GEAR_MOTOR_IN1_PIN, LOW);
+                digitalWrite(GEAR_MOTOR_IN2_PIN, HIGH);
+                analogWrite(GEAR_MOTOR_EN_PIN, SIMPLE_PWM_SPEED);
+                Serial.println("Memutar ke kiri...");
+                moved = true;
+            } else { // Sudah di atau melewati batas bawah, hentikan
+                digitalWrite(GEAR_MOTOR_IN1_PIN, LOW);
+                digitalWrite(GEAR_MOTOR_IN2_PIN, LOW);
+                analogWrite(GEAR_MOTOR_EN_PIN, 0);
+                Serial.println("Terhenti di batas bawah saat menyesuaikan ke Utara.");
+            }
+        } else if (derajat < -5) { // Jika menghadap ke Barat secara signifikan (< -5 derajat), putar searah jarum jam (kanan)
+            // Pastikan tidak melewati batas atas saat bergerak ke kanan
+            if (derajat < MAX_AZIMUTH_LIMIT) {
+                digitalWrite(GEAR_MOTOR_IN1_PIN, HIGH);
+                digitalWrite(GEAR_MOTOR_IN2_PIN, LOW);
+                analogWrite(GEAR_MOTOR_EN_PIN, SIMPLE_PWM_SPEED);
+                Serial.println("Memutar ke kanan...");
+                moved = true;
+            } else { // Sudah di atau melewati batas atas, hentikan
+                digitalWrite(GEAR_MOTOR_IN1_PIN, LOW);
+                digitalWrite(GEAR_MOTOR_IN2_PIN, LOW);
+                analogWrite(GEAR_MOTOR_EN_PIN, 0);
+                Serial.println("Terhenti di batas atas saat menyesuaikan ke Utara.");
+            }
         } else { // Dalam rentang yang dapat diterima (-5 hingga +5 derajat)
             analogWrite(GEAR_MOTOR_EN_PIN, 0); // Hentikan motor
             digitalWrite(GEAR_MOTOR_IN1_PIN, LOW);
             digitalWrite(GEAR_MOTOR_IN2_PIN, LOW);
             Serial.println("Berhasil menyelaraskan ke Utara.");
             break; // Keluar dari loop jika sudah sejajar
+        }
+
+        if (!moved) { // Jika tidak ada pergerakan yang diizinkan karena batasan, hentikan upaya penyelarasan
+            Serial.println("Tidak dapat menyelaraskan ke Utara karena batasan rotasi.");
+            break;
         }
 
         delay(100); // Penundaan kecil untuk memungkinkan motor bergerak dan kompas memperbarui
@@ -267,29 +303,72 @@ void settoNorth() {
 void resetPanelPosition() {
     Serial.println("Mengatur ulang posisi panel...");
 
-    // Menutup panel ke keadaan nol menggunakan motor kemiringan (aktuator linier)
-    // Asumsi LOW, HIGH menggerakkannya ke posisi kemiringan "tertutup" atau "nol"
-    Serial.println("Menggerakkan kemiringan ke posisi nol...");
-    digitalWrite(ACTUATOR_IN1_PIN, LOW);
-    digitalWrite(ACTUATOR_IN2_PIN, HIGH);
-    analogWrite(ACTUATOR_EN_PIN, 255); // Kecepatan penuh
-    delay(5000);    // Placeholder: Idealnya, ganti dengan sakelar batas atau umpan balik posisi
+    // Menggerakkan kemiringan ke posisi nol (misalnya, datar horizontal) menggunakan aktuator linier dan MPU6500
+    // Definisikan RESET_TILT_ANGLE sebagai sudut kemiringan saat panel dalam posisi "nol" atau "tertutup"
+    // Misalnya, 0.0 untuk datar, atau -45.0 jika itu adalah posisi tertutup secara fisik.
+    Serial.print("Menggerakkan kemiringan ke posisi ");
+    Serial.print(RESET_TILT_ANGLE);
+    Serial.println(" derajat...");
+    long tilt_timeout = millis() + 10000; // Batas waktu 10 detik untuk reset tilt
+
+    // Menggunakan kontrol proporsional sederhana untuk mencapai RESET_TILT_ANGLE
+    // Loop akan berlanjut sampai error kurang dari 2.0 derajat atau timeout
+    while (abs(tiltInput - RESET_TILT_ANGLE) > 2.0 && millis() < tilt_timeout) {
+        // Dapatkan data dari MPU6500 untuk pengukuran kemiringan aktual
+        xyzFloat gValue = myMPU6500.getGValues();
+        tiltInput = atan2(gValue.y, sqrt(gValue.x * gValue.x + gValue.z * gValue.z)) * 180.0 / PI;
+
+        double tilt_error = tiltInput - RESET_TILT_ANGLE;
+        // Hitung PWM berdasarkan error. Kp sederhana=5, min PWM 50 untuk memastikan motor bergerak
+        int pwm = constrain(int(abs(tilt_error) * 5), 50, 255);
+
+        if (tilt_error > 2.0) { // Jika panel miring ke atas dari target, miringkan ke bawah
+            digitalWrite(ACTUATOR_IN1_PIN, HIGH);
+            digitalWrite(ACTUATOR_IN2_PIN, LOW);
+        } else if (tilt_error < -2.0) { // Jika panel miring ke bawah dari target, miringkan ke atas
+            digitalWrite(ACTUATOR_IN1_PIN, LOW);
+            digitalWrite(ACTUATOR_IN2_PIN, HIGH);
+        } else { // Sudah dekat target
+            pwm = 0; // Hentikan PWM jika sudah dekat target
+        }
+        analogWrite(ACTUATOR_EN_PIN, pwm);
+        delay(50); // Penundaan kecil untuk pembacaan sensor dan pergerakan motor
+    }
     analogWrite(ACTUATOR_EN_PIN, 0); // Hentikan motor
     digitalWrite(ACTUATOR_IN1_PIN, LOW); // Pastikan pin IN1 dan IN2 LOW untuk menghentikan motor sepenuhnya
     digitalWrite(ACTUATOR_IN2_PIN, LOW);
-    Serial.println("Panel dimiringkan ke nol.");
+    Serial.println("Panel dimiringkan ke posisi reset.");
 
-    // Mengatur ulang rotasi horizontal ke titik awal
-    // Asumsi LOW, HIGH menggerakkannya ke posisi horizontal "nol"
-    Serial.println("Menggerakkan horizontal ke posisi nol...");
-    digitalWrite(GEAR_MOTOR_IN1_PIN, LOW);
-    digitalWrite(GEAR_MOTOR_IN2_PIN, HIGH);
-    analogWrite(GEAR_MOTOR_EN_PIN, 255); // Kecepatan penuh
-    delay(5000);    // Placeholder: Idealnya, ganti dengan sakelar batas atau umpan balik posisi
+    // Mengatur ulang rotasi horizontal ke titik awal yang diketahui (misalnya, batas kiri atau RESET_HORIZ_AZIMUTH)
+    Serial.print("Menggerakkan horizontal ke posisi ");
+    Serial.print(RESET_HORIZ_AZIMUTH);
+    Serial.println(" derajat...");
+    long horiz_timeout = millis() + 10000; // Batas waktu 10 detik
+
+    // Baca kompas sebelum loop untuk mendapatkan posisi awal
+    compass.read();
+    int currentAzimuth = compass.getAzimuth();
+
+    // Menggunakan kontrol sederhana untuk mencapai RESET_HORIZ_AZIMUTH
+    // Loop akan berlanjut sampai error kurang dari 5 derajat atau timeout
+    while (abs(currentAzimuth - RESET_HORIZ_AZIMUTH) > 5 && millis() < horiz_timeout) {
+        compass.read(); // Baca kompas di setiap iterasi
+        currentAzimuth = compass.getAzimuth();
+
+        if (currentAzimuth > RESET_HORIZ_AZIMUTH) { // Jika di kanan dari target, putar kiri
+            digitalWrite(GEAR_MOTOR_IN1_PIN, LOW);
+            digitalWrite(GEAR_MOTOR_IN2_PIN, HIGH);
+        } else if (currentAzimuth < RESET_HORIZ_AZIMUTH) { // Jika di kiri dari target, putar kanan
+            digitalWrite(GEAR_MOTOR_IN1_PIN, HIGH);
+            digitalWrite(GEAR_MOTOR_IN2_PIN, LOW);
+        }
+        analogWrite(GEAR_MOTOR_EN_PIN, SIMPLE_PWM_SPEED); // Gunakan kecepatan konstan untuk reset
+        delay(50);
+    }
     analogWrite(GEAR_MOTOR_EN_PIN, 0); // Hentikan motor
     digitalWrite(GEAR_MOTOR_IN1_PIN, LOW);
     digitalWrite(GEAR_MOTOR_IN2_PIN, LOW);
-    Serial.println("Rotasi horizontal kembali ke nol.");
+    Serial.println("Rotasi horizontal kembali ke posisi reset.");
 }
 
 // ============================
@@ -361,10 +440,10 @@ void setup() {
     myMPU6500.enableAccDLPF(true);  // Aktifkan Digital Low Pass Filter untuk Akselerometer
     myMPU6500.setAccDLPF(MPU6500_DLPF_3); // Atur filter Akselerometer
 
-    // Reset panel position to initial state on boot
+    // Reset posisi panel ke posisi awal saat booting
     resetPanelPosition();
 
-    // Align panel to North using compass
+    // Sesuaikan panel ke arah Utara menggunakan kompas
     settoNorth();
 }
 
@@ -421,9 +500,9 @@ void loop() {
         // Hitung sudut pitch dari data akselerometer.
         tiltInput = atan2(gValue.y, sqrt(gValue.x * gValue.x + gValue.z * gValue.z)) * 180.0 / PI; // Konversi radian ke derajat
         
-        // Dapatkan azimuth dari kompas untuk log
+        // Dapatkan azimuth dari kompas untuk log (perlu dipanggil di sini untuk mendapatkan nilai terbaru)
         compass.read();
-        int currentAzimuth = compass.getAzimuth();
+        int currentAzimuth = compass.getAzimuth(); // Azimuth saat ini (-180 hingga 180)
 
         // ===================================
         // LOGIKA KONTROL BERDASARKAN MODE YANG DIPILIH
@@ -435,15 +514,32 @@ void loop() {
             // Kontrol Motor Horizontal dengan PID
             horizontalPID.Compute(); // Hitung output PID untuk kontrol horizontal
             int pwmHorizontal = constrain(int(abs(horizontalOutput)), 0, 255); // Batasi nilai PWM antara 0-255
-            if (horizontalOutput > 0) { // Jika output positif, putar satu arah
-                digitalWrite(GEAR_MOTOR_IN1_PIN, HIGH);
-                digitalWrite(GEAR_MOTOR_IN2_PIN, LOW);
-            } else if (horizontalOutput < 0) { // Jika output negatif, putar arah lain
-                digitalWrite(GEAR_MOTOR_IN1_PIN, LOW);
-                digitalWrite(GEAR_MOTOR_IN2_PIN, HIGH);
+
+            // Terapkan batasan rotasi horizontal
+            if (horizontalOutput > 0) { // Jika output positif (putar searah jarum jam / kanan)
+                if (currentAzimuth < MAX_AZIMUTH_LIMIT) { // Izinkan putar kanan jika belum mencapai batas atas
+                    digitalWrite(GEAR_MOTOR_IN1_PIN, HIGH);
+                    digitalWrite(GEAR_MOTOR_IN2_PIN, LOW);
+                } else { // Sudah di atau melewati batas atas, hentikan motor
+                    digitalWrite(GEAR_MOTOR_IN1_PIN, LOW);
+                    digitalWrite(GEAR_MOTOR_IN2_PIN, LOW);
+                    pwmHorizontal = 0; // Pastikan PWM nol
+                    Serial.println("Batas rotasi horizontal (kanan) tercapai!");
+                }
+            } else if (horizontalOutput < 0) { // Jika output negatif (putar berlawanan arah jarum jam / kiri)
+                if (currentAzimuth > MIN_AZIMUTH_LIMIT) { // Izinkan putar kiri jika belum mencapai batas bawah
+                    digitalWrite(GEAR_MOTOR_IN1_PIN, LOW);
+                    digitalWrite(GEAR_MOTOR_IN2_PIN, HIGH);
+                } else { // Sudah di atau melewati batas bawah, hentikan motor
+                    digitalWrite(GEAR_MOTOR_IN1_PIN, LOW);
+                    digitalWrite(GEAR_MOTOR_IN2_PIN, LOW);
+                    pwmHorizontal = 0; // Pastikan PWM nol
+                    Serial.println("Batas rotasi horizontal (kiri) tercapai!");
+                }
             } else { // Jika output nol, hentikan motor
                 digitalWrite(GEAR_MOTOR_IN1_PIN, LOW);
                 digitalWrite(GEAR_MOTOR_IN2_PIN, LOW);
+                pwmHorizontal = 0; // Pastikan PWM nol
             }
             analogWrite(GEAR_MOTOR_EN_PIN, pwmHorizontal); // Terapkan PWM ke pin enable motor
 
@@ -470,20 +566,37 @@ void loop() {
             // --- Skenario A: Kontrol Sederhana (tanpa PID) ---
             Serial.println("Mode: Kontrol Sederhana");
 
+            int pwmHorizontalSimple = SIMPLE_PWM_SPEED; // Kecepatan PWM untuk kontrol sederhana
+
             // Kontrol Motor Horizontal Sederhana (On/Off berdasarkan ambang batas)
             if (horizontalError > SIMPLE_HORIZ_THRESHOLD) { // Terlalu banyak cahaya di kiri, putar kanan
-                digitalWrite(GEAR_MOTOR_IN1_PIN, HIGH);
-                digitalWrite(GEAR_MOTOR_IN2_PIN, LOW);
-                analogWrite(GEAR_MOTOR_EN_PIN, SIMPLE_PWM_SPEED);
+                // Terapkan batasan rotasi horizontal
+                if (currentAzimuth < MAX_AZIMUTH_LIMIT) { // Izinkan putar kanan jika belum mencapai batas atas
+                    digitalWrite(GEAR_MOTOR_IN1_PIN, HIGH);
+                    digitalWrite(GEAR_MOTOR_IN2_PIN, LOW);
+                } else { // Sudah di atau melewati batas atas, hentikan motor
+                    digitalWrite(GEAR_MOTOR_IN1_PIN, LOW);
+                    digitalWrite(GEAR_MOTOR_IN2_PIN, LOW);
+                    pwmHorizontalSimple = 0;
+                    Serial.println("Batas rotasi horizontal (kanan) tercapai! (Sederhana)");
+                }
             } else if (horizontalError < -SIMPLE_HORIZ_THRESHOLD) { // Terlalu banyak cahaya di kanan, putar kiri
-                digitalWrite(GEAR_MOTOR_IN1_PIN, LOW);
-                digitalWrite(GEAR_MOTOR_IN2_PIN, HIGH);
-                analogWrite(GEAR_MOTOR_EN_PIN, SIMPLE_PWM_SPEED);
+                // Terapkan batasan rotasi horizontal
+                if (currentAzimuth > MIN_AZIMUTH_LIMIT) { // Izinkan putar kiri jika belum mencapai batas bawah
+                    digitalWrite(GEAR_MOTOR_IN1_PIN, LOW);
+                    digitalWrite(GEAR_MOTOR_IN2_PIN, HIGH);
+                } else { // Sudah di atau melewati batas bawah, hentikan motor
+                    digitalWrite(GEAR_MOTOR_IN1_PIN, LOW);
+                    digitalWrite(GEAR_MOTOR_IN2_PIN, LOW);
+                    pwmHorizontalSimple = 0;
+                    Serial.println("Batas rotasi horizontal (kiri) tercapai! (Sederhana)");
+                }
             } else { // Dalam rentang toleransi, hentikan
                 digitalWrite(GEAR_MOTOR_IN1_PIN, LOW);
                 digitalWrite(GEAR_MOTOR_IN2_PIN, LOW);
-                analogWrite(GEAR_MOTOR_EN_PIN, 0);
+                pwmHorizontalSimple = 0;
             }
+            analogWrite(GEAR_MOTOR_EN_PIN, pwmHorizontalSimple);
 
             // Kontrol Motor Kemiringan Sederhana (On/Off berdasarkan ambang batas)
             if (ldrVerticalDiff > SIMPLE_TILT_THRESHOLD) { // Terlalu banyak cahaya di atas, miringkan ke bawah
